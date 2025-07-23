@@ -8,5 +8,5 @@ Set-PSReadlineKeyHandler -Key Tab -Function MenuComplete
 
 # Set aliases
 Set-Alias -Name cat -Value bat
-New-Alias -Name nvm -Value nvs
+New-Alias -Name nvm -Value fnm
 New-Alias -Name grep -Value rg
