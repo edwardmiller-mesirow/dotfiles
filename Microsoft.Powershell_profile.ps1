@@ -1,132 +1,63 @@
-#Requires -Version 7.4
+#Requires -Version 7.7
 <#
-    PowerShell profile - pwsh 7.6.x on Windows 11 / Windows Terminal.
-
-    Install at $PROFILE.CurrentUserCurrentHost, i.e.
-        $HOME\Documents\PowerShell\Microsoft.PowerShell_profile.ps1
-
-    Layout
-        1. Interactive-only guard
-        2. Console encoding
-        3. PSReadLine options
-        4. Key bindings
-        5. Aliases
-        6. Deferred initialisation (posh-git, fnm, predictors)
-        7. Prompt + Windows Terminal shell integration
-
-    Measuring startup:
-        Measure-Command { pwsh -NoLogo -Command '' }              # with profile
-        Measure-Command { pwsh -NoLogo -NoProfile -Command '' }   # baseline
+    Install at $PROFILE.CurrentUserCurrentHost for the pwsh console.
+    Optional: posh-git (1.1+), CompletionPredictor, fnm, bat, ripgrep,
+    and Microsoft.Coreutils. Open a new shell after changing this file.
 #>
 
-#region 1. Interactive-only guard ---------------------------------------------
-
-# PowerShell loads PSReadLine during engine initialisation - before profiles
-# run - and only for interactive sessions. Its absence is a cheap, reliable
-# signal that this is `pwsh -Command`, `pwsh -File`, a VS Code task or CI.
-# None of those want the prompt, the aliases or the key bindings below, and all
-# of them start faster and behave more predictably without them.
-if (-not (Get-Module -Name PSReadLine)) { return }
-
-#endregion
-
-#region 2. Console encoding ----------------------------------------------------
-
-# PowerShell 7 already sends UTF-8 to native commands ($OutputEncoding), but it
-# still *reads* their output using the console code page, which on a default
-# Windows install is 437 or 1252. Fixing that is what makes bat, rg, git, delta
-# and friends render box-drawing characters and accented text correctly.
-# InputEncoding is deliberately left alone: its setter throws when stdin is
-# redirected, and PSReadLine reads keys through the console API regardless.
-if ([Console]::OutputEncoding.CodePage -ne 65001) {
-    [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+if ($Host.Name -ne 'ConsoleHost' -or [Console]::IsInputRedirected -or
+    [Console]::IsOutputRedirected -or -not (Get-Module -Name PSReadLine)) {
+    return
 }
 
-#endregion
-
-#region 3. PSReadLine options --------------------------------------------------
-
-# Splatted rather than one call per option: a single cmdlet invocation, and the
-# whole configuration is readable in one place.
-$psReadLineOptions = @{
-    EditMode = 'Windows'
-
-    # No terminal beep on a failed completion or a backspace at column zero.
-    BellStyle = 'None'
-
-    # Default, restated: history is the only prediction source until a plugin
-    # registers itself (see the deferred CompletionPredictor import below).
-    PredictionSource = 'HistoryAndPlugin'
-
-    # InlineView is the low-friction default - grey ghost text after the cursor.
-    # F2 switches to ListView (scrollable, grouped by source, up to 50 results)
-    # at any time; set it here instead if you prefer that permanently.
-    PredictionViewStyle = 'InlineView'
-
-    # Deeper history means better predictions. PSReadLine 2.4 reads the history
-    # file as a stream, so this is cheap; the read also happens on the first
-    # ReadLine call rather than during profile execution.
-    MaximumHistoryCount = 10000
-    HistoryNoDuplicates = $true
-
-    # Essential companion to HistorySearchBackward/Forward below: without it the
-    # cursor is left mid-command after recalling a line.
-    HistorySearchCursorMovesToEnd = $true
-
-    ShowToolTips = $true
+# Source once per session so fnm's PATH setup and prompt wrappers are not repeated.
+if (Get-Variable -Name DotfilesProfileLoaded -Scope Global -ErrorAction Ignore) {
+    return
 }
-Set-PSReadLineOption @psReadLineOptions
+Set-Variable -Name DotfilesProfileLoaded -Value $true -Scope Global
 
-#endregion
+& {
+    if ($IsWindows -and [Console]::OutputEncoding.CodePage -ne 65001) {
+        try {
+            [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+        }
+        catch [System.IO.IOException] {
+            Write-Warning "Could not set console output to UTF-8: $($_.Exception.Message)"
+        }
+    }
 
-#region 4. Key bindings --------------------------------------------------------
+    $readLineOptions = @{
+        EditMode                      = 'Windows'
+        BellStyle                     = 'None'
+        PredictionViewStyle           = 'InlineView'
+        MaximumHistoryCount           = 10000
+        HistoryNoDuplicates           = $true
+        HistorySearchCursorMovesToEnd = $true
+        ShowToolTips                  = $true
+    }
+    if ($Host.UI.SupportsVirtualTerminal) {
+        $readLineOptions.PredictionSource = 'HistoryAndPlugin'
+    }
+    Set-PSReadLineOption @readLineOptions
 
-# Up/Down filter history down to commands that start with what is already typed,
-# and fall back to plain history navigation when the line is empty. When the
-# ListView prediction popup is open they navigate the list instead.
-Set-PSReadLineKeyHandler -Chord 'UpArrow'   -Function HistorySearchBackward
-Set-PSReadLineKeyHandler -Chord 'DownArrow' -Function HistorySearchForward
-
-# Tab opens the interactive completion menu instead of cycling one result at a
-# time. Left at their defaults: Shift+Tab walks the menu backwards, Ctrl+Space
-# also opens it, F2 toggles the prediction view, Alt+a selects command
-# arguments, Ctrl+r reverse-searches history.
-Set-PSReadLineKeyHandler -Chord 'Tab' -Function MenuComplete
-
-# RightArrow accepts an entire inline suggestion at end of line. Ctrl+f takes it
-# one word at a time, which is the piece most people never discover - useful
-# when the prediction is nearly right.
-Set-PSReadLineKeyHandler -Chord 'Ctrl+f' -Function ForwardWord
-
-# End goes to the end of the typed text; pressing it there accepts the whole
-# inline suggestion, matching RightArrow and zsh-autosuggestions. PSReadLine has
-# no built-in function that combines the two (PSReadLine issue #4929), so this
-# stays a script block. BriefDescription/Description make it show up properly in
-# Get-PSReadLineKeyHandler.
-$endOfLineOrAcceptSuggestion = @{
-    Chord            = 'End'
-    BriefDescription = 'EndOfLineOrAcceptSuggestion'
-    Description      = 'Move to the end of the line, or accept the inline suggestion if already there'
-    ScriptBlock      = {
+    Set-PSReadLineKeyHandler -Chord UpArrow -Function HistorySearchBackward
+    Set-PSReadLineKeyHandler -Chord DownArrow -Function HistorySearchForward
+    Set-PSReadLineKeyHandler -Chord Tab -Function MenuComplete
+    Set-PSReadLineKeyHandler -Chord Ctrl+f -Function ForwardWord
+    Set-PSReadLineKeyHandler -Chord End -BriefDescription 'EndOfLineOrAcceptSuggestion' -ScriptBlock {
         param($key, $arg)
 
-        $line = $null
-        $cursor = $null
+        $line = ''
+        $cursor = 0
         [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cursor)
-
         if ($cursor -lt $line.Length) {
             [Microsoft.PowerShell.PSConsoleReadLine]::EndOfLine($key, $arg)
         }
         else {
-            # ForwardChar at end of buffer is AcceptSuggestion, and a plain
-            # cursor move otherwise - so this stays correct with predictions off.
             [Microsoft.PowerShell.PSConsoleReadLine]::ForwardChar($key, $arg)
         }
     }
 }
-Set-PSReadLineKeyHandler @endOfLineOrAcceptSuggestion
-
-#endregion
 
 #region 5. Aliases -------------------------------------------------------------
 
