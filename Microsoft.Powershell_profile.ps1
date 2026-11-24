@@ -1,10 +1,15 @@
 #Requires -Version 7.7
 <#
-    Install at $PROFILE.CurrentUserCurrentHost for the pwsh console.
-    Optional: posh-git (1.1+), CompletionPredictor, fnm, bat, ripgrep,
-    and Microsoft.Coreutils. WinGet and the .NET SDK provide on-demand tab
-    completion. Native shortcuts bind to executables found on PATH at startup.
-    Open a new shell after changing this file.
+    PowerShell loads $PROFILE.CurrentUserCurrentHost, not the checkout.
+    Back up any existing profile, then run these commands from the repo:
+        $target = $PROFILE.CurrentUserCurrentHost
+        New-Item -ItemType Directory -Path (Split-Path -Parent $target) -Force | Out-Null
+        Copy-Item -LiteralPath .\Microsoft.Powershell_profile.ps1 -Destination $target
+
+    Copy again after updating the checkout, then open a fresh pwsh terminal.
+    With WinGet or the .NET SDK installed, press Tab after 'winget sh' or 'dotnet bu'.
+    Optional: posh-git (1.1+), CompletionPredictor, fnm, bat, ripgrep, and
+    Microsoft.Coreutils. Native shortcuts bind to executables on PATH at startup.
 #>
 
 if ($Host.Name -ne 'ConsoleHost' -or [Console]::IsInputRedirected -or
