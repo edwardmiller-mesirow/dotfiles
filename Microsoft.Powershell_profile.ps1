@@ -8,6 +8,8 @@
 
     Copy again after updating the checkout, then open a fresh pwsh terminal.
     With WinGet or the .NET SDK installed, press Tab after 'winget sh' or 'dotnet bu'.
+    WinGet lookups run in the background. If there are no suggestions on the
+    first Tab, press it again after a moment. Cached suggestions appear immediately.
     Optional: posh-git (1.1+), CompletionPredictor, fnm, bat, ripgrep, and
     Microsoft.Coreutils. Native shortcuts bind to executables on PATH at startup.
 #>
@@ -127,53 +129,206 @@ Set-Variable -Name DotfilesProfileLoaded -Value $true -Scope Global
         function global:ll { Get-ChildItem -Force @args }
     }
 
-    foreach ($cliName in 'winget', 'dotnet') {
-        $exeName = "$cliName.exe"
-        $completionExe = $applications[$exeName]
-        if ($completionExe) {
-            Register-ArgumentCompleter -Native -CommandName $cliName, $exeName -ScriptBlock ({
-                param($wordToComplete, $commandAst, $cursorPosition)
+    $wingetExe = $applications['winget.exe']
+    if ($wingetExe) {
+        $wingetState = @{
+            Cache = [System.Collections.Generic.OrderedDictionary[ValueTuple[string,string,int,string],object]]::new()
+            Pending = $null
+            Stop = {
+                param([System.Diagnostics.Process]$process)
 
-                # The AST omits trailing spaces and may start after other statements.
-                $position = $cursorPosition - $commandAst.Extent.StartOffset
-                $commandLine = $commandAst.Extent.Text.PadRight($position)
-                $completionArgs = if ($cliName -eq 'winget') {
-                    $textPosition = [System.Globalization.StringInfo]::new($commandLine.Substring(0, $position)).LengthInTextElements
-                    'complete', "--word=$wordToComplete", '--commandline', $commandLine, '--position', $textPosition
+                if (-not $process.HasExited) {
+                    Stop-Process -Id $process.Id -ErrorAction SilentlyContinue -ErrorVariable stopError
+                    if ($stopError -and -not $process.HasExited) {
+                        Write-Warning "Could not stop WinGet completion: $stopError"
+                    }
                 }
-                else {
-                    'complete', '--position', $position, $commandLine
+            }
+        }
+        $wingetTimeoutMs = 5000
+        $wingetTimer = [System.Timers.Timer]::new($wingetTimeoutMs)
+        $wingetTimer.AutoReset = $false
+        $stopPendingWinget = {
+            $state = $Event.MessageData
+            $pending = $state.Pending
+            if ($pending -and -not $pending.Done.IsCompleted) {
+                $remaining = $pending.Deadline - [Environment]::TickCount64
+                if ($Event.SourceIdentifier -eq 'PowerShell.Exiting' -or $remaining -le 0) {
+                    $pending.TimedOut = $true
+                    & $state.Stop $pending.Process
                 }
+                elseif (-not $Sender.Enabled) {
+                    # A queued timer event can arrive just before the current deadline.
+                    $Sender.Interval = $remaining
+                    $Sender.Start()
+                }
+            }
+        }
+        Register-ObjectEvent -InputObject $wingetTimer -EventName Elapsed -MessageData $wingetState -Action $stopPendingWinget | Out-Null
+        Register-EngineEvent -SourceIdentifier PowerShell.Exiting -MessageData $wingetState -Action $stopPendingWinget | Out-Null
 
-                # Standard argument passing preserves quotes without manual escaping.
-                Set-Variable -Name PSNativeCommandArgumentPassing -Value 'Standard'
-                Set-Variable -Name PSApplicationOutputEncoding -Value ([System.Text.Encoding]::UTF8)
-                $exitVariable = Get-Variable -Name LASTEXITCODE -Scope Global -ErrorAction Ignore
-                $previousExitCode = if ($exitVariable) { $exitVariable.Value }
+        Register-ArgumentCompleter -Native -CommandName winget, winget.exe -ScriptBlock ({
+            param($wordToComplete, $commandAst, $cursorPosition)
+
+            # The AST omits trailing spaces and may start after other statements.
+            $position = $cursorPosition - $commandAst.Extent.StartOffset
+            $commandLine = $commandAst.Extent.Text.PadRight($position)
+            $cwd = $ExecutionContext.SessionState.Path.CurrentFileSystemLocation.ProviderPath
+            $key = [ValueTuple[string,string,int,string]]::new($commandLine, $wordToComplete, $position, $cwd)
+            $now = [Environment]::TickCount64
+            $cache = $wingetState.Cache
+            $pending = $wingetState.Pending
+            $failed = $false
+
+            if ($pending -and ($pending.TimedOut -or $pending.Done.IsCompleted)) {
+                $wingetTimer.Stop()
+                $wingetState.Pending = $null
+                $failed = $key.Equals($pending.Key)
                 try {
-                    $candidates = & $completionExe @completionArgs
-                    $exitCode = $LASTEXITCODE
-                }
-                finally {
-                    if ($exitVariable) {
-                        $exitVariable.Value = $previousExitCode
+                    if ($pending.TimedOut) {
+                        Write-Verbose 'WinGet completion timed out.'
+                    }
+                    elseif ($pending.Done.IsFaulted) {
+                        Write-Verbose "WinGet completion failed: $($pending.Done.Exception.GetBaseException().Message)"
+                    }
+                    elseif ($pending.Process.ExitCode -ne 0) {
+                        Write-Verbose "WinGet completion failed (exit code $($pending.Process.ExitCode)): $($pending.Error.Result.Trim())"
                     }
                     else {
-                        Remove-Variable -Name LASTEXITCODE -Scope Global -ErrorAction Ignore
+                        $failed = $false
+                        $results = foreach ($candidate in $pending.Output.Result -split '\r?\n') {
+                            if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+                                [System.Management.Automation.CompletionResult]::new($candidate, $candidate, 'ParameterValue', $candidate)
+                            }
+                        }
+                        [void]$cache.Remove($pending.Key)
+                        if ($cache.Count -ge 64) {
+                            $cache.RemoveAt(0)
+                        }
+                        $ttl = if ($results) { 60000 } else { 15000 }
+                        $cache.Add($pending.Key, @{
+                            Results = $results
+                            RefreshAt = $pending.StartedAt + $ttl
+                            ExpiresAt = $pending.StartedAt + 300000
+                        })
                     }
                 }
-                if ($exitCode -ne 0) {
-                    Write-Verbose "$exeName completion failed (exit code $exitCode)."
-                    return
+                finally {
+                    $pending.Process.Dispose()
+                }
+                $pending = $null
+            }
+
+            $entry = $null
+            if ($cache.TryGetValue($key, [ref]$entry)) {
+                [void]$cache.Remove($key)
+                if ($now -lt $entry.ExpiresAt) {
+                    $cache.Add($key, $entry)
+                }
+                else {
+                    $entry = $null
+                }
+            }
+
+            # Serve stale hits while refreshing, and keep only the latest lookup in flight.
+            if (-not $failed -and (-not $entry -or $now -ge $entry.RefreshAt) -and
+                (-not $pending -or -not $key.Equals($pending.Key))) {
+                if ($pending) {
+                    $wingetTimer.Stop()
+                    $wingetState.Pending = $null
+                    & $wingetState.Stop $pending.Process
+                    $pending.Process.Dispose()
                 }
 
-                foreach ($candidate in $candidates) {
-                    if (-not [string]::IsNullOrWhiteSpace($candidate)) {
-                        [System.Management.Automation.CompletionResult]::new($candidate, $candidate, 'ParameterValue', $candidate)
+                $start = [System.Diagnostics.ProcessStartInfo]::new($wingetExe)
+                $start.UseShellExecute = $false
+                $start.CreateNoWindow = $true
+                $start.WorkingDirectory = $cwd
+                $start.RedirectStandardInput = $true
+                $start.RedirectStandardOutput = $true
+                $start.RedirectStandardError = $true
+                $start.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+                $start.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+                $textPosition = [System.Globalization.StringInfo]::new($commandLine.Substring(0, $position)).LengthInTextElements
+                foreach ($argument in 'complete', "--word=$wordToComplete", '--commandline', $commandLine, '--position', $textPosition) {
+                    $start.ArgumentList.Add([string]$argument)
+                }
+
+                $process = $null
+                try {
+                    $process = [System.Diagnostics.Process]::Start($start)
+                    $process.StandardInput.Close()
+                    $output = $process.StandardOutput.ReadToEndAsync()
+                    $errorOutput = $process.StandardError.ReadToEndAsync()
+                    $wingetState.Pending = @{
+                        Key = $key
+                        Process = $process
+                        Output = $output
+                        Error = $errorOutput
+                        Done = [System.Threading.Tasks.Task]::WhenAll([System.Threading.Tasks.Task[]]@(
+                            $output, $errorOutput, $process.WaitForExitAsync()
+                        ))
+                        StartedAt = $now
+                        Deadline = [Environment]::TickCount64 + $wingetTimeoutMs
+                        TimedOut = $false
+                    }
+                    $wingetTimer.Interval = $wingetTimeoutMs
+                    $wingetTimer.Start()
+                }
+                catch [System.ComponentModel.Win32Exception], [System.InvalidOperationException], [System.IO.IOException] {
+                    Write-Verbose "Could not start WinGet completion: $($_.Exception.Message)"
+                    $wingetState.Pending = $null
+                    if ($process) {
+                        & $wingetState.Stop $process
+                        $process.Dispose()
                     }
                 }
-            }.GetNewClosure())
-        }
+            }
+
+            if ($entry) {
+                $entry.Results
+            }
+            elseif ($wingetState.Pending -and $key.Equals($wingetState.Pending.Key)) {
+                # An empty string suppresses filename completion while WinGet is still working.
+                ''
+            }
+        }.GetNewClosure())
+    }
+
+    $dotnetExe = $applications['dotnet.exe']
+    if ($dotnetExe) {
+        Register-ArgumentCompleter -Native -CommandName dotnet, dotnet.exe -ScriptBlock ({
+            param($wordToComplete, $commandAst, $cursorPosition)
+
+            $position = $cursorPosition - $commandAst.Extent.StartOffset
+            $commandLine = $commandAst.Extent.Text.PadRight($position)
+            Set-Variable -Name PSNativeCommandArgumentPassing -Value 'Standard'
+            Set-Variable -Name PSApplicationOutputEncoding -Value ([System.Text.Encoding]::UTF8)
+            $exitVariable = Get-Variable -Name LASTEXITCODE -Scope Global -ErrorAction Ignore
+            $previousExitCode = if ($exitVariable) { $exitVariable.Value }
+            try {
+                $candidates = & $dotnetExe complete --position $position $commandLine
+                $exitCode = $LASTEXITCODE
+            }
+            finally {
+                if ($exitVariable) {
+                    $exitVariable.Value = $previousExitCode
+                }
+                else {
+                    Remove-Variable -Name LASTEXITCODE -Scope Global -ErrorAction Ignore
+                }
+            }
+            if ($exitCode -ne 0) {
+                Write-Verbose "dotnet.exe completion failed (exit code $exitCode)."
+                return
+            }
+
+            foreach ($candidate in $candidates) {
+                if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+                    [System.Management.Automation.CompletionResult]::new($candidate, $candidate, 'ParameterValue', $candidate)
+                }
+            }
+        }.GetNewClosure())
     }
 
     # Load optional tools before the first prompt so drawing it has no setup work.
