@@ -7,7 +7,10 @@
         Copy-Item -LiteralPath .\Microsoft.Powershell_profile.ps1 -Destination $target
 
     Copy again after updating the checkout, then open a fresh pwsh terminal.
-    Press Tab after 'winget nst' or 'dotnet bu' to complete commands by substring.
+    Press Tab after 'winget ' or 'dotnet ' to open the PSReadLine menu. Type to
+    narrow it by prefix, or navigate with Tab and the arrow keys.
+    Before Tab, subcommands fall back to substring matches when no prefix matches
+    (e.g. 'winget nst' finds install and uninstall).
     The first Tab can wait up to five seconds for uncached native suggestions.
     Cached suggestions appear immediately and refresh in the background.
     Optional: posh-git (1.1+), CompletionPredictor, fnm, bat, ripgrep, and
@@ -56,7 +59,6 @@ Set-Variable -Name DotfilesProfileLoaded -Value $true -Scope Global
 
     Set-PSReadLineKeyHandler -Chord UpArrow -Function HistorySearchBackward
     Set-PSReadLineKeyHandler -Chord DownArrow -Function HistorySearchForward
-    # Keep PSReadLine's menu for both CLIs: typing narrows the open list without another lookup.
     Set-PSReadLineKeyHandler -Chord Tab -Function MenuComplete
     Set-PSReadLineKeyHandler -Chord Ctrl+f -Function ForwardWord
     Set-PSReadLineKeyHandler -Chord End -BriefDescription 'EndOfLineOrAcceptSuggestion' -ScriptBlock {
@@ -348,33 +350,33 @@ Set-Variable -Name DotfilesProfileLoaded -Value $true -Scope Global
                 return
             }
 
-            # Seed the menu from the command catalog so a prefix-only CLI cannot hide
-            # substring matches before PSReadLine takes over. Leave argument values to the CLI.
             $candidates = @(& $getCompletion "$cliName " '' ($cliName.Length + 1) $cwd $deadline)
-            if ($cliName -eq 'winget') {
+            if ($cliName -eq 'winget' -or -not $candidates) {
                 # WinGet includes aliases only when asked to match a non-empty word.
                 $candidates = @(& $getCompletion $commandLine $wordToComplete $position $cwd $deadline) + $candidates
             }
-            elseif (-not $candidates) {
-                & $getCompletion $commandLine $wordToComplete $position $cwd $deadline
-                return
-            }
 
+            # Mixing prefix and substring matches can make MenuComplete lose the
+            # typed prefix, since it starts filtering from the common prefix.
             $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            $hasPrefixMatch = $false
             $substringMatches = [System.Collections.Generic.List[System.Management.Automation.CompletionResult]]::new()
             foreach ($candidate in $candidates) {
                 $text = $candidate.CompletionText
-                if ($text[0] -in '-', '/' -or -not $seen.Add($text)) {
+                if ($text -notmatch '^[a-z0-9][a-z0-9-]*$' -or -not $seen.Add($text)) {
                     continue
                 }
                 if ($text.StartsWith($wordToComplete, [StringComparison]::OrdinalIgnoreCase)) {
+                    $hasPrefixMatch = $true
                     $candidate
                 }
                 elseif ($text.Contains($wordToComplete, [StringComparison]::OrdinalIgnoreCase)) {
                     $substringMatches.Add($candidate)
                 }
             }
-            $substringMatches
+            if (-not $hasPrefixMatch) {
+                $substringMatches
+            }
         }.GetNewClosure())
     }
 
