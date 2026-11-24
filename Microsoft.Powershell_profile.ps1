@@ -7,8 +7,8 @@
         Copy-Item -LiteralPath .\Microsoft.Powershell_profile.ps1 -Destination $target
 
     Copy again after updating the checkout, then open a fresh pwsh terminal.
-    With WinGet or the .NET SDK installed, press Tab after 'winget sh' or 'dotnet bu'.
-    WinGet waits up to five seconds for uncached suggestions on the first Tab.
+    Press Tab after 'winget nst' or 'dotnet bu' to complete commands by substring.
+    The first Tab can wait up to five seconds for uncached native suggestions.
     Cached suggestions appear immediately and refresh in the background.
     Optional: posh-git (1.1+), CompletionPredictor, fnm, bat, ripgrep, and
     Microsoft.Coreutils. Native shortcuts bind to executables on PATH at startup.
@@ -56,6 +56,7 @@ Set-Variable -Name DotfilesProfileLoaded -Value $true -Scope Global
 
     Set-PSReadLineKeyHandler -Chord UpArrow -Function HistorySearchBackward
     Set-PSReadLineKeyHandler -Chord DownArrow -Function HistorySearchForward
+    # Keep PSReadLine's menu for both CLIs: typing narrows the open list without another lookup.
     Set-PSReadLineKeyHandler -Chord Tab -Function MenuComplete
     Set-PSReadLineKeyHandler -Chord Ctrl+f -Function ForwardWord
     Set-PSReadLineKeyHandler -Chord End -BriefDescription 'EndOfLineOrAcceptSuggestion' -ScriptBlock {
@@ -129,9 +130,14 @@ Set-Variable -Name DotfilesProfileLoaded -Value $true -Scope Global
         function global:ll { Get-ChildItem -Force @args }
     }
 
-    $wingetExe = $applications['winget.exe']
-    if ($wingetExe) {
-        $wingetState = @{
+    foreach ($cliName in 'winget', 'dotnet') {
+        $exeName = "$cliName.exe"
+        $completionExe = $applications[$exeName]
+        if (-not $completionExe) {
+            continue
+        }
+
+        $completionState = @{
             Cache = [System.Collections.Generic.OrderedDictionary[ValueTuple[string,string,int,string],object]]::new()
             Pending = $null
             Stop = {
@@ -140,15 +146,15 @@ Set-Variable -Name DotfilesProfileLoaded -Value $true -Scope Global
                 if (-not $process.HasExited) {
                     Stop-Process -Id $process.Id -ErrorAction SilentlyContinue -ErrorVariable stopError
                     if ($stopError -and -not $process.HasExited) {
-                        Write-Warning "Could not stop WinGet completion: $stopError"
+                        Write-Warning "Could not stop native completion: $stopError"
                     }
                 }
             }
         }
-        $wingetTimeoutMs = 5000
-        $wingetTimer = [System.Timers.Timer]::new($wingetTimeoutMs)
-        $wingetTimer.AutoReset = $false
-        $stopPendingWinget = {
+        $completionTimeoutMs = 5000
+        $completionTimer = [System.Timers.Timer]::new($completionTimeoutMs)
+        $completionTimer.AutoReset = $false
+        $stopPendingCompletion = {
             $state = $Event.MessageData
             $pending = $state.Pending
             if ($pending -and -not $pending.Done.IsCompleted) {
@@ -164,25 +170,25 @@ Set-Variable -Name DotfilesProfileLoaded -Value $true -Scope Global
                 }
             }
         }
-        Register-ObjectEvent -InputObject $wingetTimer -EventName Elapsed -MessageData $wingetState -Action $stopPendingWinget | Out-Null
-        Register-EngineEvent -SourceIdentifier PowerShell.Exiting -MessageData $wingetState -Action $stopPendingWinget | Out-Null
+        Register-ObjectEvent -InputObject $completionTimer -EventName Elapsed -MessageData $completionState -Action $stopPendingCompletion | Out-Null
+        Register-EngineEvent -SourceIdentifier PowerShell.Exiting -MessageData $completionState -Action $stopPendingCompletion | Out-Null
 
-        $receiveWingetCompletion = {
+        $receiveCompletion = {
             param($pending)
 
-            $wingetTimer.Stop()
-            $wingetState.Pending = $null
+            $completionTimer.Stop()
+            $completionState.Pending = $null
             try {
                 if ($pending.TimedOut) {
-                    Write-Verbose 'WinGet completion timed out.'
+                    Write-Verbose "$exeName completion timed out."
                     return $false
                 }
                 if ($pending.Done.IsFaulted) {
-                    Write-Verbose "WinGet completion failed: $($pending.Done.Exception.GetBaseException().Message)"
+                    Write-Verbose "$exeName completion failed: $($pending.Done.Exception.GetBaseException().Message)"
                     return $false
                 }
                 if ($pending.Process.ExitCode -ne 0) {
-                    Write-Verbose "WinGet completion failed (exit code $($pending.Process.ExitCode)): $($pending.Error.Result.Trim())"
+                    Write-Verbose "$exeName completion failed (exit code $($pending.Process.ExitCode)): $($pending.Error.Result.Trim())"
                     return $false
                 }
 
@@ -191,7 +197,7 @@ Set-Variable -Name DotfilesProfileLoaded -Value $true -Scope Global
                         [System.Management.Automation.CompletionResult]::new($candidate, $candidate, 'ParameterValue', $candidate)
                     }
                 }
-                $cache = $wingetState.Cache
+                $cache = $completionState.Cache
                 [void]$cache.Remove($pending.Key)
                 if ($cache.Count -ge 64) {
                     $cache.RemoveAt(0)
@@ -209,21 +215,17 @@ Set-Variable -Name DotfilesProfileLoaded -Value $true -Scope Global
             }
         }.GetNewClosure()
 
-        Register-ArgumentCompleter -Native -CommandName winget, winget.exe -ScriptBlock ({
-            param($wordToComplete, $commandAst, $cursorPosition)
+        $getCompletion = {
+            param([string]$commandLine, [string]$wordToComplete, [int]$position, [string]$cwd, [long]$deadline)
 
-            # The AST omits trailing spaces and may start after other statements.
-            $position = $cursorPosition - $commandAst.Extent.StartOffset
-            $commandLine = $commandAst.Extent.Text.PadRight($position)
-            $cwd = $ExecutionContext.SessionState.Path.CurrentFileSystemLocation.ProviderPath
             $key = [ValueTuple[string,string,int,string]]::new($commandLine, $wordToComplete, $position, $cwd)
             $now = [Environment]::TickCount64
-            $cache = $wingetState.Cache
-            $pending = $wingetState.Pending
+            $cache = $completionState.Cache
+            $pending = $completionState.Pending
             $failed = $false
 
             if ($pending -and ($pending.TimedOut -or $pending.Done.IsCompleted)) {
-                $received = & $receiveWingetCompletion $pending
+                $received = & $receiveCompletion $pending
                 $failed = -not $received -and $key.Equals($pending.Key)
                 $pending = $null
             }
@@ -239,17 +241,18 @@ Set-Variable -Name DotfilesProfileLoaded -Value $true -Scope Global
                 }
             }
 
-            # Serve stale hits while refreshing, and keep only the latest lookup in flight.
-            if (-not $failed -and (-not $entry -or $now -ge $entry.RefreshAt) -and
-                (-not $pending -or -not $key.Equals($pending.Key))) {
+            # A cache miss can replace a running refresh; a stale hit does not need to.
+            if (-not $failed -and ($entry -or $now -lt $deadline) -and
+                (-not $entry -or $now -ge $entry.RefreshAt) -and
+                (-not $pending -or (-not $entry -and -not $key.Equals($pending.Key)))) {
                 if ($pending) {
-                    $wingetTimer.Stop()
-                    $wingetState.Pending = $null
-                    & $wingetState.Stop $pending.Process
+                    $completionTimer.Stop()
+                    $completionState.Pending = $null
+                    & $completionState.Stop $pending.Process
                     $pending.Process.Dispose()
                 }
 
-                $start = [System.Diagnostics.ProcessStartInfo]::new($wingetExe)
+                $start = [System.Diagnostics.ProcessStartInfo]::new($completionExe)
                 $start.UseShellExecute = $false
                 $start.CreateNoWindow = $true
                 $start.WorkingDirectory = $cwd
@@ -258,8 +261,14 @@ Set-Variable -Name DotfilesProfileLoaded -Value $true -Scope Global
                 $start.RedirectStandardError = $true
                 $start.StandardOutputEncoding = [System.Text.Encoding]::UTF8
                 $start.StandardErrorEncoding = [System.Text.Encoding]::UTF8
-                $textPosition = [System.Globalization.StringInfo]::new($commandLine.Substring(0, $position)).LengthInTextElements
-                foreach ($argument in 'complete', "--word=$wordToComplete", '--commandline', $commandLine, '--position', $textPosition) {
+                $arguments = if ($cliName -eq 'winget') {
+                    $textPosition = [System.Globalization.StringInfo]::new($commandLine.Substring(0, $position)).LengthInTextElements
+                    'complete', "--word=$wordToComplete", '--commandline', $commandLine, '--position', $textPosition
+                }
+                else {
+                    'complete', '--position', $position, $commandLine
+                }
+                foreach ($argument in $arguments) {
                     $start.ArgumentList.Add([string]$argument)
                 }
 
@@ -269,7 +278,7 @@ Set-Variable -Name DotfilesProfileLoaded -Value $true -Scope Global
                     $process.StandardInput.Close()
                     $output = $process.StandardOutput.ReadToEndAsync()
                     $errorOutput = $process.StandardError.ReadToEndAsync()
-                    $wingetState.Pending = @{
+                    $completionState.Pending = @{
                         Key = $key
                         Process = $process
                         Output = $output
@@ -278,17 +287,17 @@ Set-Variable -Name DotfilesProfileLoaded -Value $true -Scope Global
                             $output, $errorOutput, $process.WaitForExitAsync()
                         ))
                         StartedAt = $now
-                        Deadline = [Environment]::TickCount64 + $wingetTimeoutMs
+                        Deadline = [Environment]::TickCount64 + $completionTimeoutMs
                         TimedOut = $false
                     }
-                    $wingetTimer.Interval = $wingetTimeoutMs
-                    $wingetTimer.Start()
+                    $completionTimer.Interval = $completionTimeoutMs
+                    $completionTimer.Start()
                 }
                 catch [System.ComponentModel.Win32Exception], [System.InvalidOperationException], [System.IO.IOException] {
-                    Write-Verbose "Could not start WinGet completion: $($_.Exception.Message)"
-                    $wingetState.Pending = $null
+                    Write-Verbose "Could not start $exeName completion: $($_.Exception.Message)"
+                    $completionState.Pending = $null
                     if ($process) {
-                        & $wingetState.Stop $process
+                        & $completionState.Stop $process
                         $process.Dispose()
                     }
                 }
@@ -299,10 +308,10 @@ Set-Variable -Name DotfilesProfileLoaded -Value $true -Scope Global
                 return
             }
 
-            $pending = $wingetState.Pending
+            $pending = $completionState.Pending
             if ($pending -and $key.Equals($pending.Key)) {
                 # PSReadLine needs the matches before this completion call returns.
-                $remaining = [Math]::Max(0, $pending.Deadline - [Environment]::TickCount64)
+                $remaining = [Math]::Max(0, [Math]::Min($deadline, $pending.Deadline) - [Environment]::TickCount64)
                 if (-not $pending.TimedOut) {
                     try {
                         $null = $pending.Done.Wait([int]$remaining)
@@ -316,48 +325,56 @@ Set-Variable -Name DotfilesProfileLoaded -Value $true -Scope Global
                 }
                 if (-not $pending.Done.IsCompleted -and -not $pending.TimedOut) {
                     $pending.TimedOut = $true
-                    & $wingetState.Stop $pending.Process
+                    & $completionState.Stop $pending.Process
                 }
-                if (& $receiveWingetCompletion $pending) {
+                if (& $receiveCompletion $pending) {
                     $cache[$key].Results
                 }
             }
-        }.GetNewClosure())
-    }
+        }.GetNewClosure()
 
-    $dotnetExe = $applications['dotnet.exe']
-    if ($dotnetExe) {
-        Register-ArgumentCompleter -Native -CommandName dotnet, dotnet.exe -ScriptBlock ({
+        Register-ArgumentCompleter -Native -CommandName $cliName, $exeName -ScriptBlock ({
             param($wordToComplete, $commandAst, $cursorPosition)
 
+            $deadline = [Environment]::TickCount64 + $completionTimeoutMs
+            # The AST omits trailing spaces and may start after other statements.
             $position = $cursorPosition - $commandAst.Extent.StartOffset
             $commandLine = $commandAst.Extent.Text.PadRight($position)
-            Set-Variable -Name PSNativeCommandArgumentPassing -Value 'Standard'
-            Set-Variable -Name PSApplicationOutputEncoding -Value ([System.Text.Encoding]::UTF8)
-            $exitVariable = Get-Variable -Name LASTEXITCODE -Scope Global -ErrorAction Ignore
-            $previousExitCode = if ($exitVariable) { $exitVariable.Value }
-            try {
-                $candidates = & $dotnetExe complete --position $position $commandLine
-                $exitCode = $LASTEXITCODE
-            }
-            finally {
-                if ($exitVariable) {
-                    $exitVariable.Value = $previousExitCode
-                }
-                else {
-                    Remove-Variable -Name LASTEXITCODE -Scope Global -ErrorAction Ignore
-                }
-            }
-            if ($exitCode -ne 0) {
-                Write-Verbose "dotnet.exe completion failed (exit code $exitCode)."
+            $cwd = $ExecutionContext.SessionState.Path.CurrentFileSystemLocation.ProviderPath
+            $firstArgument = if ($commandAst.CommandElements.Count -gt 1) { $commandAst.CommandElements[1] }
+            if ($wordToComplete -notmatch '^[a-z0-9][a-z0-9-]*$' -or -not $firstArgument -or
+                $cursorPosition -lt $firstArgument.Extent.StartOffset -or $cursorPosition -gt $firstArgument.Extent.EndOffset) {
+                & $getCompletion $commandLine $wordToComplete $position $cwd $deadline
                 return
             }
 
+            # Seed the menu from the command catalog so a prefix-only CLI cannot hide
+            # substring matches before PSReadLine takes over. Leave argument values to the CLI.
+            $candidates = @(& $getCompletion "$cliName " '' ($cliName.Length + 1) $cwd $deadline)
+            if ($cliName -eq 'winget') {
+                # WinGet includes aliases only when asked to match a non-empty word.
+                $candidates = @(& $getCompletion $commandLine $wordToComplete $position $cwd $deadline) + $candidates
+            }
+            elseif (-not $candidates) {
+                & $getCompletion $commandLine $wordToComplete $position $cwd $deadline
+                return
+            }
+
+            $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            $substringMatches = [System.Collections.Generic.List[System.Management.Automation.CompletionResult]]::new()
             foreach ($candidate in $candidates) {
-                if (-not [string]::IsNullOrWhiteSpace($candidate)) {
-                    [System.Management.Automation.CompletionResult]::new($candidate, $candidate, 'ParameterValue', $candidate)
+                $text = $candidate.CompletionText
+                if ($text[0] -in '-', '/' -or -not $seen.Add($text)) {
+                    continue
+                }
+                if ($text.StartsWith($wordToComplete, [StringComparison]::OrdinalIgnoreCase)) {
+                    $candidate
+                }
+                elseif ($text.Contains($wordToComplete, [StringComparison]::OrdinalIgnoreCase)) {
+                    $substringMatches.Add($candidate)
                 }
             }
+            $substringMatches
         }.GetNewClosure())
     }
 
