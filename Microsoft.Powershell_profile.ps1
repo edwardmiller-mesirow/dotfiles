@@ -11,6 +11,12 @@
     narrow it by prefix, or navigate with Tab and the arrow keys.
     Before Tab, subcommands fall back to substring matches when no prefix matches
     (e.g. 'winget nst' finds install and uninstall).
+    For WinGet packages, type a prefix before Tab (e.g. 'winget install vscode').
+    Type more in the open menu to narrow the results without calling WinGet again.
+    If the menu is full, narrow the query before pressing Tab to find more matches.
+    Plain 'winget update Mic' and 'winget upgrade Mic' queries can show installed
+    package names first; the full WinGet results are cached in the background.
+    Long update labels may be shortened to fit two columns, but insert in full.
     The first Tab can wait up to five seconds for uncached native suggestions.
     Cached suggestions appear immediately and refresh in the background.
     Optional: posh-git (1.1+), CompletionPredictor, fnm, bat, ripgrep, and
@@ -132,6 +138,32 @@ Set-Variable -Name DotfilesProfileLoaded -Value $true -Scope Global
         function global:ll { Get-ChildItem -Force @args }
     }
 
+    $getPreferredMatches = {
+        param($candidates, [string]$word, [switch]$commandNames)
+
+        # MenuComplete starts filtering from the common prefix. Keep non-prefix
+        # matches out of that menu unless there are no prefix matches at all.
+        $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        $fallback = [System.Collections.Generic.List[System.Management.Automation.CompletionResult]]::new()
+        $hasPrefixMatch = $false
+        foreach ($candidate in $candidates) {
+            $text = $candidate.ListItemText
+            if (($commandNames -and $text -notmatch '^[a-z0-9][a-z0-9-]*$') -or -not $seen.Add($candidate.CompletionText)) {
+                continue
+            }
+            if ($text.StartsWith($word, [StringComparison]::OrdinalIgnoreCase)) {
+                $hasPrefixMatch = $true
+                $candidate
+            }
+            elseif (-not $commandNames -or $text.Contains($word, [StringComparison]::OrdinalIgnoreCase)) {
+                $fallback.Add($candidate)
+            }
+        }
+        if (-not $hasPrefixMatch) {
+            $fallback
+        }
+    }
+
     foreach ($cliName in 'winget', 'dotnet') {
         $exeName = "$cliName.exe"
         $completionExe = $applications[$exeName]
@@ -196,7 +228,13 @@ Set-Variable -Name DotfilesProfileLoaded -Value $true -Scope Global
 
                 $results = foreach ($candidate in $pending.Output.Result -split '\r?\n') {
                     if (-not [string]::IsNullOrWhiteSpace($candidate)) {
-                        [System.Management.Automation.CompletionResult]::new($candidate, $candidate, 'ParameterValue', $candidate)
+                        # WinGet quotes names with spaces for insertion, not for display or filtering.
+                        $label = if ($cliName -eq 'winget' -and $candidate.Length -gt 2 -and
+                            $candidate[0] -eq '"' -and $candidate[-1] -eq '"') {
+                            $candidate.Substring(1, $candidate.Length - 2)
+                        }
+                        else { $candidate }
+                        [System.Management.Automation.CompletionResult]::new($candidate, $label, 'ParameterValue', $label)
                     }
                 }
                 $cache = $completionState.Cache
@@ -218,7 +256,10 @@ Set-Variable -Name DotfilesProfileLoaded -Value $true -Scope Global
         }.GetNewClosure()
 
         $getCompletion = {
-            param([string]$commandLine, [string]$wordToComplete, [int]$position, [string]$cwd, [long]$deadline)
+            param(
+                [string]$commandLine, [string]$wordToComplete, [int]$position, [string]$cwd, [long]$deadline,
+                [switch]$reusePrefix, [switch]$cacheOnly, [switch]$background, [int]$processTimeoutMs = $completionTimeoutMs
+            )
 
             $key = [ValueTuple[string,string,int,string]]::new($commandLine, $wordToComplete, $position, $cwd)
             $now = [Environment]::TickCount64
@@ -243,10 +284,45 @@ Set-Variable -Name DotfilesProfileLoaded -Value $true -Scope Global
                 }
             }
 
+            $preview = $null
+            if ($reusePrefix -and -not $entry) {
+                # Only reuse a shorter word in the same slot and context (including --source).
+                $bestLength = 0
+                foreach ($cached in $cache.GetEnumerator()) {
+                    $prefix = $cached.Key.Item2
+                    if ($prefix.Length -le $bestLength -or $prefix.Length -ge $wordToComplete.Length -or
+                        $now -ge $cached.Value.ExpiresAt -or -not $cached.Value.Results -or
+                        -not $cwd.Equals($cached.Key.Item4, [StringComparison]::Ordinal) -or
+                        -not $wordToComplete.StartsWith($prefix, [StringComparison]::Ordinal)) {
+                        continue
+                    }
+                    $removed = $wordToComplete.Length - $prefix.Length
+                    $previousPosition = $position - $removed
+                    if ($cached.Key.Item3 -ne $previousPosition -or
+                        -not $commandLine.Remove($previousPosition, $removed).Equals($cached.Key.Item1, [StringComparison]::Ordinal)) {
+                        continue
+                    }
+                    $matches = @(foreach ($candidate in $cached.Value.Results) {
+                        if ($candidate.ListItemText.StartsWith($wordToComplete, [StringComparison]::OrdinalIgnoreCase)) {
+                            $candidate
+                        }
+                    })
+                    if ($matches.Count) {
+                        $bestLength = $prefix.Length
+                        $preview = $matches
+                    }
+                }
+            }
+
+            if ($cacheOnly -and -not $entry -and -not $preview) {
+                return
+            }
+
+            $allowBackground = $processTimeoutMs -gt $completionTimeoutMs
             # A cache miss can replace a running refresh; a stale hit does not need to.
-            if (-not $failed -and ($entry -or $now -lt $deadline) -and
+            if (-not $failed -and ($entry -or $allowBackground -or $now -lt $deadline) -and
                 (-not $entry -or $now -ge $entry.RefreshAt) -and
-                (-not $pending -or (-not $entry -and -not $key.Equals($pending.Key)))) {
+                (-not $pending -or (-not $entry -and -not $preview -and -not $key.Equals($pending.Key)))) {
                 if ($pending) {
                     $completionTimer.Stop()
                     $completionState.Pending = $null
@@ -289,10 +365,10 @@ Set-Variable -Name DotfilesProfileLoaded -Value $true -Scope Global
                             $output, $errorOutput, $process.WaitForExitAsync()
                         ))
                         StartedAt = $now
-                        Deadline = [Environment]::TickCount64 + $completionTimeoutMs
+                        Deadline = [Environment]::TickCount64 + $processTimeoutMs
                         TimedOut = $false
                     }
-                    $completionTimer.Interval = $completionTimeoutMs
+                    $completionTimer.Interval = $processTimeoutMs
                     $completionTimer.Start()
                 }
                 catch [System.ComponentModel.Win32Exception], [System.InvalidOperationException], [System.IO.IOException] {
@@ -307,6 +383,14 @@ Set-Variable -Name DotfilesProfileLoaded -Value $true -Scope Global
 
             if ($entry) {
                 $entry.Results
+                return
+            }
+            if ($preview) {
+                # A shorter search need not be exhaustive. Don't cache this as the exact answer.
+                $preview
+                return
+            }
+            if ($background) {
                 return
             }
 
@@ -326,6 +410,9 @@ Set-Variable -Name DotfilesProfileLoaded -Value $true -Scope Global
                     }
                 }
                 if (-not $pending.Done.IsCompleted -and -not $pending.TimedOut) {
+                    if ($allowBackground -and [Environment]::TickCount64 -lt $pending.Deadline) {
+                        return
+                    }
                     $pending.TimedOut = $true
                     & $completionState.Stop $pending.Process
                 }
@@ -336,7 +423,7 @@ Set-Variable -Name DotfilesProfileLoaded -Value $true -Scope Global
         }.GetNewClosure()
 
         Register-ArgumentCompleter -Native -CommandName $cliName, $exeName -ScriptBlock ({
-            param($wordToComplete, $commandAst, $cursorPosition)
+            param([string]$wordToComplete, $commandAst, $cursorPosition)
 
             $deadline = [Environment]::TickCount64 + $completionTimeoutMs
             # The AST omits trailing spaces and may start after other statements.
@@ -346,7 +433,89 @@ Set-Variable -Name DotfilesProfileLoaded -Value $true -Scope Global
             $firstArgument = if ($commandAst.CommandElements.Count -gt 1) { $commandAst.CommandElements[1] }
             if ($wordToComplete -notmatch '^[a-z0-9][a-z0-9-]*$' -or -not $firstArgument -or
                 $cursorPosition -lt $firstArgument.Extent.StartOffset -or $cursorPosition -gt $firstArgument.Extent.EndOffset) {
-                & $getCompletion $commandLine $wordToComplete $position $cwd $deadline
+                $packageWord = ''
+                $wordStart = $cursorPosition - $wordToComplete.Length
+                if ($cliName -eq 'winget' -and $wordToComplete -and $wordToComplete[0] -ne '-' -and
+                    $firstArgument -and $wordStart -gt $firstArgument.Extent.EndOffset -and
+                    $firstArgument.Extent.Text -in 'install', 'add', 'search', 'find', 'show', 'view', 'list', 'ls',
+                        'upgrade', 'update', 'uninstall', 'remove', 'rm', 'download', 'repair') {
+                    # Let WinGet resolve positional queries, filters, and other option values.
+                    $packageWord = $wordToComplete.Trim([char]34, [char]39)
+                }
+                if (-not $packageWord) {
+                    & $getCompletion $commandLine $wordToComplete $position $cwd $deadline
+                    return
+                }
+
+                $reusePrefix = $wordToComplete -match '^[\p{L}\p{Nd}][\p{L}\p{M}\p{Nd}._+-]*$' -and
+                    ($position -eq $commandLine.Length -or [char]::IsWhiteSpace($commandLine[$position])) -and
+                    $commandLine.Substring($position - $wordToComplete.Length, $wordToComplete.Length) -ceq $wordToComplete
+                $plainUpgradeQuery = $reusePrefix -and $firstArgument.Extent.Text -in 'upgrade', 'update' -and
+                    $commandAst.CommandElements.Count -eq 3 -and $position -eq $commandLine.Length
+                if ($plainUpgradeQuery) {
+                    # A field-specific lookup is faster than WinGet's broad upgrade search.
+                    # Use the full result when cached; don't overwrite it with the name preview.
+                    $query = @{
+                        CommandLine = $commandLine; WordToComplete = $wordToComplete; Position = $position
+                        Cwd = $cwd; Deadline = $deadline; ReusePrefix = $true; ProcessTimeoutMs = 20000
+                    }
+                    $candidates = @(& $getCompletion @query -CacheOnly)
+                    if (-not $candidates) {
+                        $fullKey = [ValueTuple[string,string,int,string]]::new($commandLine, $wordToComplete, $position, $cwd)
+                        $fullPending = $completionState.Pending -and $fullKey.Equals($completionState.Pending.Key)
+                        $nameOption = '--name '
+                        $nameQuery = $commandLine.Insert($position - $wordToComplete.Length, $nameOption)
+                        $names = @(& $getCompletion $nameQuery $wordToComplete ($position + $nameOption.Length) $cwd $deadline -ReusePrefix -CacheOnly:$fullPending)
+                        $candidates = @(& $getCompletion @query -Background:($names.Count -gt 0))
+                        if (-not $candidates) {
+                            $candidates = $names
+                        }
+                    }
+                }
+                else {
+                    $candidates = @(& $getCompletion $commandLine $wordToComplete $position $cwd $deadline -ReusePrefix:$reusePrefix)
+                }
+                # The fallback keeps native matches such as Store IDs and monikers.
+                $preferred = @(& $getPreferredMatches $candidates $packageWord)
+                if ($preferred.Count -gt 1) {
+                    # PSReadLine switches to a static list if the menu doesn't fit.
+                    # Reserve space for the prompt and a wrapped input line; keep the cache uncapped.
+                    $rows = [Math]::Max(1, [Console]::WindowHeight - 2 - (Get-PSReadLineOption).ExtraPromptLineCount)
+                    $width = [Math]::Max(1, [Console]::BufferWidth)
+                    $maxLabelWidth = [Math]::Floor($width / 2) - 2
+                    $compactLabels = $plainUpgradeQuery -and $maxLabelWidth -ge 24
+                    $menu = [System.Collections.Generic.List[System.Management.Automation.CompletionResult]]::new()
+                    $columnWidth = 1
+                    foreach ($candidate in $preferred) {
+                        $label = $candidate.ListItemText
+                        $labelWidth = $Host.UI.RawUI.LengthInBufferCells($label)
+                        if ($compactLabels -and $labelWidth -gt $maxLabelWidth) {
+                            # Clip at a text element boundary; PSReadLine also filters on the full CompletionText.
+                            $elements = [Globalization.StringInfo]::GetTextElementEnumerator($label)
+                            $end = 0
+                            $cells = 0
+                            while ($elements.MoveNext()) {
+                                $element = $elements.GetTextElement()
+                                $cells += $Host.UI.RawUI.LengthInBufferCells($element)
+                                if ($cells + 3 -gt $maxLabelWidth) {
+                                    break
+                                }
+                                $end += $element.Length
+                            }
+                            $shortLabel = $label.Substring(0, $end) + '...'
+                            $labelWidth = $Host.UI.RawUI.LengthInBufferCells($shortLabel)
+                            $candidate = [System.Management.Automation.CompletionResult]::new(
+                                $candidate.CompletionText, $shortLabel, $candidate.ResultType, "Package: $label")
+                        }
+                        $columnWidth = [Math]::Min($width, [Math]::Max($columnWidth, $labelWidth + 2))
+                        if ($menu.Count -ge $rows * [Math]::Floor($width / $columnWidth)) {
+                            break
+                        }
+                        $menu.Add($candidate)
+                    }
+                    $preferred = $menu
+                }
+                $preferred
                 return
             }
 
@@ -356,27 +525,7 @@ Set-Variable -Name DotfilesProfileLoaded -Value $true -Scope Global
                 $candidates = @(& $getCompletion $commandLine $wordToComplete $position $cwd $deadline) + $candidates
             }
 
-            # Mixing prefix and substring matches can make MenuComplete lose the
-            # typed prefix, since it starts filtering from the common prefix.
-            $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-            $hasPrefixMatch = $false
-            $substringMatches = [System.Collections.Generic.List[System.Management.Automation.CompletionResult]]::new()
-            foreach ($candidate in $candidates) {
-                $text = $candidate.CompletionText
-                if ($text -notmatch '^[a-z0-9][a-z0-9-]*$' -or -not $seen.Add($text)) {
-                    continue
-                }
-                if ($text.StartsWith($wordToComplete, [StringComparison]::OrdinalIgnoreCase)) {
-                    $hasPrefixMatch = $true
-                    $candidate
-                }
-                elseif ($text.Contains($wordToComplete, [StringComparison]::OrdinalIgnoreCase)) {
-                    $substringMatches.Add($candidate)
-                }
-            }
-            if (-not $hasPrefixMatch) {
-                $substringMatches
-            }
+            & $getPreferredMatches $candidates $wordToComplete -CommandNames
         }.GetNewClosure())
     }
 
