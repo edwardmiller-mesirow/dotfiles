@@ -2,8 +2,9 @@
 <#
     Install at $PROFILE.CurrentUserCurrentHost for the pwsh console.
     Optional: posh-git (1.1+), CompletionPredictor, fnm, bat, ripgrep,
-    and Microsoft.Coreutils. Native shortcuts bind to executables found on PATH
-    at startup. Open a new shell after changing this file.
+    and Microsoft.Coreutils. WinGet and the .NET SDK provide on-demand tab
+    completion. Native shortcuts bind to executables found on PATH at startup.
+    Open a new shell after changing this file.
 #>
 
 if ($Host.Name -ne 'ConsoleHost' -or [Console]::IsInputRedirected -or
@@ -75,7 +76,7 @@ Set-Variable -Name DotfilesProfileLoaded -Value $true -Scope Global
         nvm   = 'fnm.exe'
     }
     $applications = @{}
-    $exeNames = @($nativeAliases.Values) + @('bat.exe', 'ls.exe')
+    $exeNames = @($nativeAliases.Values) + @('bat.exe', 'ls.exe', 'winget.exe', 'dotnet.exe')
     foreach ($application in (Get-Command -Name $exeNames -CommandType Application -All -ErrorAction Ignore)) {
         # Windows sort.exe can be earlier on PATH than Coreutils sort.exe.
         if ($IsWindows -and $application.Name -eq 'sort.exe' -and
@@ -119,6 +120,55 @@ Set-Variable -Name DotfilesProfileLoaded -Value $true -Scope Global
     }
     else {
         function global:ll { Get-ChildItem -Force @args }
+    }
+
+    foreach ($cliName in 'winget', 'dotnet') {
+        $exeName = "$cliName.exe"
+        $completionExe = $applications[$exeName]
+        if ($completionExe) {
+            Register-ArgumentCompleter -Native -CommandName $cliName, $exeName -ScriptBlock ({
+                param($wordToComplete, $commandAst, $cursorPosition)
+
+                # The AST omits trailing spaces and may start after other statements.
+                $position = $cursorPosition - $commandAst.Extent.StartOffset
+                $commandLine = $commandAst.Extent.Text.PadRight($position)
+                $completionArgs = if ($cliName -eq 'winget') {
+                    $textPosition = [System.Globalization.StringInfo]::new($commandLine.Substring(0, $position)).LengthInTextElements
+                    'complete', "--word=$wordToComplete", '--commandline', $commandLine, '--position', $textPosition
+                }
+                else {
+                    'complete', '--position', $position, $commandLine
+                }
+
+                # Standard argument passing preserves quotes without manual escaping.
+                Set-Variable -Name PSNativeCommandArgumentPassing -Value 'Standard'
+                Set-Variable -Name PSApplicationOutputEncoding -Value ([System.Text.Encoding]::UTF8)
+                $exitVariable = Get-Variable -Name LASTEXITCODE -Scope Global -ErrorAction Ignore
+                $previousExitCode = if ($exitVariable) { $exitVariable.Value }
+                try {
+                    $candidates = & $completionExe @completionArgs
+                    $exitCode = $LASTEXITCODE
+                }
+                finally {
+                    if ($exitVariable) {
+                        $exitVariable.Value = $previousExitCode
+                    }
+                    else {
+                        Remove-Variable -Name LASTEXITCODE -Scope Global -ErrorAction Ignore
+                    }
+                }
+                if ($exitCode -ne 0) {
+                    Write-Verbose "$exeName completion failed (exit code $exitCode)."
+                    return
+                }
+
+                foreach ($candidate in $candidates) {
+                    if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+                        [System.Management.Automation.CompletionResult]::new($candidate, $candidate, 'ParameterValue', $candidate)
+                    }
+                }
+            }.GetNewClosure())
+        }
     }
 
     # Load optional tools before the first prompt so drawing it has no setup work.
