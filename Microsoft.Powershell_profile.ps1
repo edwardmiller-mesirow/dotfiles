@@ -57,80 +57,55 @@ Set-Variable -Name DotfilesProfileLoaded -Value $true -Scope Global
             [Microsoft.PowerShell.PSConsoleReadLine]::ForwardChar($key, $arg)
         }
     }
+
+    # Only yield PowerShell names to available executables, not aliases or functions.
+    $coreutilsNames = 'cat', 'cp', 'ls', 'mv', 'rm', 'rmdir', 'sort'
+    $applications = @{}
+    $exeNames = @($coreutilsNames | ForEach-Object { "$_.exe" }) + @('bat.exe', 'rg.exe', 'fnm.exe')
+    foreach ($application in (Get-Command -Name $exeNames -CommandType Application -ErrorAction Ignore)) {
+        if (-not $applications.ContainsKey($application.Name)) {
+            $applications[$application.Name] = $application.Path
+        }
+    }
+    foreach ($name in $coreutilsNames) {
+        $executable = $applications["$name.exe"]
+        # The Windows sort.exe is not Coreutils and is normally already on PATH.
+        if ($executable -and -not ($name -eq 'sort' -and $executable -like "$env:SystemRoot\*")) {
+            Remove-Alias -Name $name -Scope Global -Force -ErrorAction Ignore
+        }
+    }
+    if ($applications['bat.exe']) {
+        Set-Alias -Name cat -Value $applications['bat.exe'] -Scope Global -Force
+    }
+    if ($applications['rg.exe']) {
+        Set-Alias -Name grep -Value $applications['rg.exe'] -Scope Global
+    }
+    $fnmExe = $applications['fnm.exe']
+    if ($fnmExe) {
+        Set-Alias -Name nvm -Value $fnmExe -Scope Global
+    }
+
+    $lsExe = $applications['ls.exe']
+    if ($lsExe) {
+        $lsOptions = '--color=auto', '--group-directories-first', '--human-readable'
+        Set-Item -Path Function:\global:ls -Value ({ & $lsExe @lsOptions @args }.GetNewClosure())
+        Set-Item -Path Function:\global:ll -Value ({ & $lsExe @lsOptions -la @args }.GetNewClosure())
+
+        if ($null -eq $env:LS_COLORS) {
+            $env:LS_COLORS = @(
+                'di=1;38;5;75', 'ln=1;38;5;80', 'or=1;38;5;203', 'ex=1;38;5;114'
+                '*.ps1=38;5;114', '*.psm1=38;5;114', '*.psd1=38;5;114'
+                '*.zip=38;5;180', '*.7z=38;5;180', '*.gz=38;5;180', '*.tar=38;5;180'
+                '*.md=38;5;186', '*.txt=38;5;186'
+                '*.json=38;5;186', '*.yml=38;5;186', '*.yaml=38;5;186', '*.toml=38;5;186'
+                '*.png=38;5;177', '*.jpg=38;5;177', '*.svg=38;5;177', '*.webp=38;5;177'
+            ) -join ':'
+        }
+    }
+    else {
+        function global:ll { Get-ChildItem -Force @args }
+    }
 }
-
-#region 5. Aliases -------------------------------------------------------------
-
-# Coreutils for Windows (winget install Microsoft.Coreutils) ships cat, cp, ls,
-# mv, rm, rmdir, sleep, sort, tee and others that PowerShell shadows with an
-# alias to a cmdlet. Clearing those aliases is what lets the real binaries win.
-#
-# Two things about how that package integrates with PowerShell:
-#   * Its installer hooks PSConsoleHostReadLine and rewrites interactive input
-#     before PowerShell resolves the command name. At the prompt that can beat
-#     an alias defined here, and Get-Command will not reveal it - the README is
-#     explicit that Get-Command/Get-Help still report PowerShell's own names.
-#     `coreutils-manager disable <name>` (elevated) hands a name back.
-#   * That hook loads only in the console host, so scripts and the VS Code
-#     terminal still see PowerShell's aliases. Clearing them here is what keeps
-#     the two environments behaving the same way.
-#
-# -Force is needed because the built-ins are ReadOnly; -ErrorAction Ignore keeps
-# $Error empty, which matters because the prompt below inspects $Error[0].
-# `find` is deliberately absent: it was never a PowerShell alias, so Coreutils'
-# find already wins as long as its directory precedes System32 on PATH.
-Remove-Alias -Name cat, cp, ls, mv, rm, rmdir, sort -Force -ErrorAction Ignore
-
-# Set-Alias rather than New-Alias: idempotent, so re-sourcing this profile or
-# running it in a session that already has these aliases does not error.
-# Coreutils ships both `cat` and `grep`, so see the note above if these two
-# appear to have no effect at the prompt.
-Set-Alias -Name cat  -Value bat
-Set-Alias -Name grep -Value rg
-
-# fnm reads .node-version and .nvmrc, so nvm muscle memory mostly carries over.
-Set-Alias -Name nvm  -Value fnm
-
-# Coreutils' ls follows GNU and prints no colour unless asked, so wrap it. This
-# only works because the `ls` alias was cleared above: an alias beats a
-# function, but a function beats an executable. `dir` and `gci` are untouched,
-# so object-based listing is still one keystroke away.
-#
-# Check anything you add here against `ls --help` first - an unrecognised option
-# makes ls fail outright rather than being ignored. Two GNU options worth
-# testing for, since uutils may or may not have them yet:
-#   --time-style=long-iso   sortable 2026-09-02 14:33 timestamps under -l
-#   --hyperlink=auto        clickable file names in Windows Terminal
-$LsDefaultArgs = @(
-    '--color=auto'                  # colour only when stdout is a terminal
-    '--group-directories-first'     # directories above files
-    '--human-readable'              # 4.2K rather than 4300, under -l
-)
-
-# ls.exe rather than ls: the explicit extension forces application resolution,
-# so the function cannot recurse into itself. If you ever run
-# `coreutils-manager disable ls`, switch these to `coreutils ls` - the multi-call
-# binary still dispatches by name once its own entry point is gone.
-function global:ls { ls.exe @LsDefaultArgs @args }
-function global:ll { ls.exe @LsDefaultArgs -l -a @args }
-
-# Palette. LS_COLORS replaces ls's built-in defaults wholesale rather than
-# merging into them, so anything absent here renders uncoloured. `dircolors` is
-# one of the utilities deliberately not shipped on Windows, so setting this by
-# hand is the only route. Purely taste - delete it for the stock colours.
-$env:LS_COLORS = @(
-    'di=1;38;5;75'      # directories
-    'ln=1;38;5;80'      # symlinks
-    'or=1;38;5;203'     # broken symlinks
-    'ex=1;38;5;114'     # executables
-    '*.ps1=38;5;114', '*.psm1=38;5;114', '*.psd1=38;5;114'
-    '*.zip=38;5;180', '*.7z=38;5;180', '*.gz=38;5;180', '*.tar=38;5;180'
-    '*.md=38;5;186', '*.txt=38;5;186'
-    '*.json=38;5;186', '*.yml=38;5;186', '*.yaml=38;5;186', '*.toml=38;5;186'
-    '*.png=38;5;177', '*.jpg=38;5;177', '*.svg=38;5;177', '*.webp=38;5;177'
-) -join ':'
-
-#endregion
 
 #region 6. Deferred initialisation ---------------------------------------------
 
