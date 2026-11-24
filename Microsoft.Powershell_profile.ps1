@@ -2,7 +2,8 @@
 <#
     Install at $PROFILE.CurrentUserCurrentHost for the pwsh console.
     Optional: posh-git (1.1+), CompletionPredictor, fnm, bat, ripgrep,
-    and Microsoft.Coreutils. Open a new shell after changing this file.
+    and Microsoft.Coreutils. Native shortcuts bind to executables found on PATH
+    at startup. Open a new shell after changing this file.
 #>
 
 if ($Host.Name -ne 'ConsoleHost' -or [Console]::IsInputRedirected -or
@@ -63,35 +64,44 @@ Set-Variable -Name DotfilesProfileLoaded -Value $true -Scope Global
         }
     }
 
-    # Only yield PowerShell names to available executables, not aliases or functions.
-    $coreutilsNames = 'cat', 'cp', 'ls', 'mv', 'rm', 'rmdir', 'sort'
+    $nativeAliases = @{
+        cat   = 'cat.exe'
+        cp    = 'cp.exe'
+        mv    = 'mv.exe'
+        rm    = 'rm.exe'
+        rmdir = 'rmdir.exe'
+        sort  = 'sort.exe'
+        grep  = 'rg.exe'
+        nvm   = 'fnm.exe'
+    }
     $applications = @{}
-    $exeNames = @($coreutilsNames | ForEach-Object { "$_.exe" }) + @('bat.exe', 'rg.exe', 'fnm.exe')
-    foreach ($application in (Get-Command -Name $exeNames -CommandType Application -ErrorAction Ignore)) {
+    $exeNames = @($nativeAliases.Values) + @('bat.exe', 'ls.exe')
+    foreach ($application in (Get-Command -Name $exeNames -CommandType Application -All -ErrorAction Ignore)) {
+        # Windows sort.exe can be earlier on PATH than Coreutils sort.exe.
+        if ($IsWindows -and $application.Name -eq 'sort.exe' -and
+            $application.Path.StartsWith("$env:SystemRoot\", [StringComparison]::OrdinalIgnoreCase)) {
+            continue
+        }
         if (-not $applications.ContainsKey($application.Name)) {
             $applications[$application.Name] = $application.Path
         }
     }
-    foreach ($name in $coreutilsNames) {
-        $executable = $applications["$name.exe"]
-        # The Windows sort.exe is not Coreutils and is normally already on PATH.
-        if ($executable -and -not ($name -eq 'sort' -and $executable -like "$env:SystemRoot\*")) {
-            Remove-Alias -Name $name -Scope Global -Force -ErrorAction Ignore
-        }
-    }
     if ($applications['bat.exe']) {
-        Set-Alias -Name cat -Value $applications['bat.exe'] -Scope Global -Force
+        $nativeAliases['cat'] = 'bat.exe'
     }
-    if ($applications['rg.exe']) {
-        Set-Alias -Name grep -Value $applications['rg.exe'] -Scope Global
-    }
-    $fnmExe = $applications['fnm.exe']
-    if ($fnmExe) {
-        Set-Alias -Name nvm -Value $fnmExe -Scope Global
+    foreach ($shortcut in $nativeAliases.GetEnumerator()) {
+        $executable = $applications[$shortcut.Value]
+        if ($executable) {
+            # Built-in aliases such as cp cannot lose their AllScope option.
+            $existingAlias = Get-Alias -Name $shortcut.Key -Scope Global -ErrorAction Ignore
+            $options = if ($existingAlias) { $existingAlias.Options } else { 'None' }
+            Set-Alias -Name $shortcut.Key -Value $executable -Option $options -Scope Global -Force
+        }
     }
 
     $lsExe = $applications['ls.exe']
     if ($lsExe) {
+        Remove-Alias -Name ls -Scope Global -Force -ErrorAction Ignore
         $lsOptions = '--color=auto', '--group-directories-first', '--human-readable'
         Set-Item -Path Function:\global:ls -Value ({ & $lsExe @lsOptions @args }.GetNewClosure())
         Set-Item -Path Function:\global:ll -Value ({ & $lsExe @lsOptions -la @args }.GetNewClosure())
@@ -124,6 +134,7 @@ Set-Variable -Name DotfilesProfileLoaded -Value $true -Scope Global
         }
     }
 
+    $fnmExe = $applications['fnm.exe']
     if ($fnmExe) {
         try {
             $fnmScript = & {
