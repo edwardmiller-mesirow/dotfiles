@@ -17,6 +17,7 @@ if (Get-Variable -Name DotfilesProfileLoaded -Scope Global -ErrorAction Ignore) 
 Set-Variable -Name DotfilesProfileLoaded -Value $true -Scope Global
 
 & {
+    $useTerminalMarks = $env:WT_SESSION -and $env:TERM_PROGRAM -ne 'vscode'
     if ($IsWindows -and [Console]::OutputEncoding.CodePage -ne 65001) {
         try {
             [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
@@ -37,6 +38,10 @@ Set-Variable -Name DotfilesProfileLoaded -Value $true -Scope Global
     }
     if ($Host.UI.SupportsVirtualTerminal) {
         $readLineOptions.PredictionSource = 'HistoryAndPlugin'
+    }
+    if ($useTerminalMarks) {
+        # The trailing OSC marker prevents PSReadLine from matching the prompt suffix.
+        $readLineOptions.PromptText = ''
     }
     Set-PSReadLineOption @readLineOptions
 
@@ -105,137 +110,63 @@ Set-Variable -Name DotfilesProfileLoaded -Value $true -Scope Global
     else {
         function global:ll { Get-ChildItem -Force @args }
     }
-}
 
-#region 6. Deferred initialisation ---------------------------------------------
-
-# posh-git (~300 ms) and fnm (~80 ms) are the only expensive pieces here, and
-# neither is needed until a prompt is actually drawn. Running them from the
-# first prompt makes pwsh interactive immediately while still completing before
-# a command can realistically be typed.
-#
-# A flag is used rather than rewriting $function:prompt, so any wrapper a host
-# has already installed - VS Code's shell integration, for instance - survives.
-# The flag is set before the work, so a failure cannot cause a retry every line.
-
-$global:__ProfileInitialized = $false
-
-function global:__Initialize-Profile {
-    $global:__ProfileInitialized = $true
-
-    # Git status in the prompt. Defines $GitPromptScriptBlock, which the prompt
-    # below calls. Install with: Install-PSResource posh-git
-    Import-Module posh-git -Global -MinimumVersion 1.1.0 -NoClobber -ErrorAction Ignore
-
-    # Tab-completion results as prediction suggestions - this is what makes
-    # PredictionSource 'HistoryAndPlugin' mean more than plain history, and it
-    # is where ListView really pays off. Install with:
-    #   Install-PSResource CompletionPredictor
-    Import-Module CompletionPredictor -Global -ErrorAction Ignore
-
-    # fnm: PATH and environment, plus a `cd` hook that activates the Node
-    # version pinned by .node-version / .nvmrc in the directory you land in.
-    # Note --use-on-cd rebinds `cd` (to Set-LocationWithFnm); Set-Location and
-    # pushd are not hooked. Joining the lines instead of using fnm's documented
-    # `| Out-String` avoids any chance of the formatter wrapping the long
-    # `$env:PATH = ...` line at the console width.
-    if (Get-Command fnm -CommandType Application -ErrorAction Ignore) {
-        Invoke-Expression ((fnm env --use-on-cd --shell powershell) -join "`n")
-    }
-}
-
-#endregion
-
-#region 7. Prompt --------------------------------------------------------------
-
-# The prompt proper. Falls back to PowerShell's default rendering if posh-git
-# is not installed, so a missing module degrades visibly instead of erroring on
-# every line.
-function global:__Get-CorePrompt {
-    if (-not $global:__ProfileInitialized) { __Initialize-Profile }
-
-    if ($GitPromptScriptBlock) {
-        & $GitPromptScriptBlock
-    }
-    else {
-        "PS $($ExecutionContext.SessionState.Path.CurrentLocation)$('>' * ($NestedPromptLevel + 1)) "
-    }
-}
-
-# Windows Terminal shell integration: OSC 133 semantic marks and OSC 9;9 for the
-# working directory. This is what enables marks on the scrollbar, Ctrl+Up/Down
-# between prompts, "select command output", recent-command suggestions, and new
-# tabs opening in the current directory.
-#
-# Skipped inside VS Code, which injects its own OSC 633 integration after the
-# profile runs and would end up double-marking. WT_SESSION alone is not enough:
-# launching `code` from Windows Terminal leaks that variable into VS Code's
-# integrated terminals.
-#
-# Terminal side, in settings.json:
-#   "profiles": { "defaults": { "showMarksOnScrollbar": true, "autoMarkPrompts": true } }
-if ($env:WT_SESSION -and $env:TERM_PROGRAM -ne 'vscode') {
-
-    # PSReadLine uses PromptText to recolour the prompt on a parse error. It
-    # looks for that text at the end of the rendered prompt, which is now an
-    # escape sequence, so the feature cannot work; disabling it explicitly
-    # avoids any partial re-render.
-    Set-PSReadLineOption -PromptText ''
-
-    $global:__LastHistoryId = -1
-
-    # Distinguishes "the last native command exited non-zero" from "PowerShell
-    # itself raised an error", so the Terminal can colour the mark accordingly.
-    # $? must be read before anything else runs, hence the separate function.
-    function global:__Get-LastExitCode {
-        if ($?) { return 0 }
-
-        $lastHistoryEntry = Get-History -Count 1
-        if ($Error[0].InvocationInfo.HistoryId -eq $lastHistoryEntry.Id) { return -1 }
-
-        return $LASTEXITCODE
-    }
-
-    function global:prompt {
-        # Keep this first: any other statement would overwrite $?.
-        $exitCode = __Get-LastExitCode
-        $lastHistoryEntry = Get-History -Count 1
-        $out = ''
-
-        # OSC 133;D - end of the previous command, with its status. Skipped
-        # before the first command, and emitted without a status when Enter was
-        # pressed on an empty line or the line was cancelled with Ctrl+c.
-        if ($global:__LastHistoryId -ne -1) {
-            $out += if ($lastHistoryEntry.Id -eq $global:__LastHistoryId) {
-                "`e]133;D`a"
+    # Load optional tools before the first prompt so drawing it has no setup work.
+    foreach ($spec in @(@{ ModuleName = 'posh-git'; ModuleVersion = '1.1.0' }, 'CompletionPredictor')) {
+        $module = Get-Module -ListAvailable -FullyQualifiedName $spec | Select-Object -First 1
+        if ($module) {
+            try {
+                Import-Module -ModuleInfo $module -Global -NoClobber -ErrorAction Stop
             }
-            else {
-                "`e]133;D;$exitCode`a"
+            catch {
+                Write-Warning "Could not load $($module.Name): $($_.Exception.Message)"
             }
         }
+    }
 
-        # OSC 133;A - prompt start.
-        $out += "`e]133;A`a"
-
-        # OSC 9;9 - working directory, for "duplicate tab" and new panes. Only
-        # meaningful for a real filesystem path, so Registry: / Cert: locations
-        # are skipped rather than reported as nonsense.
-        $location = $ExecutionContext.SessionState.Path.CurrentLocation
-        if ($location.Provider.Name -eq 'FileSystem') {
-            $out += "`e]9;9;`"$($location.ProviderPath)`"`a"
+    if ($fnmExe) {
+        try {
+            $fnmScript = & {
+                # Decode fnm's UTF-8 output without relying on the console code page.
+                Set-Variable -Name PSApplicationOutputEncoding -Value ([System.Text.Encoding]::UTF8)
+                $code = (& $fnmExe env --use-on-cd --shell powershell) -join "`n"
+                if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($code)) {
+                    throw "fnm env returned no usable PowerShell script (exit code $LASTEXITCODE)."
+                }
+                $code
+            }
+            # fnm emits the environment changes and the global cd hook.
+            & ([scriptblock]::Create($fnmScript))
         }
+        catch {
+            Write-Warning "Could not initialize fnm: $($_.Exception.Message)"
+        }
+    }
 
-        $out += __Get-CorePrompt
+    if ($useTerminalMarks) {
+        & {
+            $basePrompt = $function:prompt
+            $history = @{ HasPrompted = $false; Id = $null }
+            Set-Item -Path Function:\global:prompt -Value ({
+                $succeeded = $?
+                $entry = Get-History -Count 1
+                $historyId = if ($entry) { $entry.Id }
+                $finished = ''
+                if ($history.HasPrompted) {
+                    # Terminal colors only need success/failure; LASTEXITCODE can be stale.
+                    $finished = if ($historyId -eq $history.Id) { "`e]133;D`a" }
+                    elseif ($succeeded) { "`e]133;D;0`a" }
+                    else { "`e]133;D;1`a" }
+                }
+                $history.HasPrompted = $true
+                $history.Id = $historyId
 
-        # OSC 133;B - prompt end / command start.
-        $out += "`e]133;B`a"
-
-        $global:__LastHistoryId = $lastHistoryEntry.Id
-        $out
+                $location = $ExecutionContext.SessionState.Path.CurrentLocation
+                $cwd = if ($location.Provider.Name -eq 'FileSystem' -and $location.ProviderPath -notmatch '["\p{Cc}]') {
+                    "`e]9;9;`"$($location.ProviderPath)`"`a"
+                }
+                "$finished`e]133;A`a$cwd$((& $basePrompt) -join '')`e]133;B`a"
+            }.GetNewClosure())
+        }
     }
 }
-else {
-    function global:prompt { __Get-CorePrompt }
-}
-
-#endregion
