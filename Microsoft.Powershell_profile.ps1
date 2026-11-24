@@ -8,8 +8,8 @@
 
     Copy again after updating the checkout, then open a fresh pwsh terminal.
     With WinGet or the .NET SDK installed, press Tab after 'winget sh' or 'dotnet bu'.
-    WinGet lookups run in the background. If there are no suggestions on the
-    first Tab, press it again after a moment. Cached suggestions appear immediately.
+    WinGet waits up to five seconds for uncached suggestions on the first Tab.
+    Cached suggestions appear immediately and refresh in the background.
     Optional: posh-git (1.1+), CompletionPredictor, fnm, bat, ripgrep, and
     Microsoft.Coreutils. Native shortcuts bind to executables on PATH at startup.
 #>
@@ -167,6 +167,48 @@ Set-Variable -Name DotfilesProfileLoaded -Value $true -Scope Global
         Register-ObjectEvent -InputObject $wingetTimer -EventName Elapsed -MessageData $wingetState -Action $stopPendingWinget | Out-Null
         Register-EngineEvent -SourceIdentifier PowerShell.Exiting -MessageData $wingetState -Action $stopPendingWinget | Out-Null
 
+        $receiveWingetCompletion = {
+            param($pending)
+
+            $wingetTimer.Stop()
+            $wingetState.Pending = $null
+            try {
+                if ($pending.TimedOut) {
+                    Write-Verbose 'WinGet completion timed out.'
+                    return $false
+                }
+                if ($pending.Done.IsFaulted) {
+                    Write-Verbose "WinGet completion failed: $($pending.Done.Exception.GetBaseException().Message)"
+                    return $false
+                }
+                if ($pending.Process.ExitCode -ne 0) {
+                    Write-Verbose "WinGet completion failed (exit code $($pending.Process.ExitCode)): $($pending.Error.Result.Trim())"
+                    return $false
+                }
+
+                $results = foreach ($candidate in $pending.Output.Result -split '\r?\n') {
+                    if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+                        [System.Management.Automation.CompletionResult]::new($candidate, $candidate, 'ParameterValue', $candidate)
+                    }
+                }
+                $cache = $wingetState.Cache
+                [void]$cache.Remove($pending.Key)
+                if ($cache.Count -ge 64) {
+                    $cache.RemoveAt(0)
+                }
+                $ttl = if ($results) { 60000 } else { 15000 }
+                $cache.Add($pending.Key, @{
+                    Results = $results
+                    RefreshAt = $pending.StartedAt + $ttl
+                    ExpiresAt = $pending.StartedAt + 300000
+                })
+                return $true
+            }
+            finally {
+                $pending.Process.Dispose()
+            }
+        }.GetNewClosure()
+
         Register-ArgumentCompleter -Native -CommandName winget, winget.exe -ScriptBlock ({
             param($wordToComplete, $commandAst, $cursorPosition)
 
@@ -181,41 +223,8 @@ Set-Variable -Name DotfilesProfileLoaded -Value $true -Scope Global
             $failed = $false
 
             if ($pending -and ($pending.TimedOut -or $pending.Done.IsCompleted)) {
-                $wingetTimer.Stop()
-                $wingetState.Pending = $null
-                $failed = $key.Equals($pending.Key)
-                try {
-                    if ($pending.TimedOut) {
-                        Write-Verbose 'WinGet completion timed out.'
-                    }
-                    elseif ($pending.Done.IsFaulted) {
-                        Write-Verbose "WinGet completion failed: $($pending.Done.Exception.GetBaseException().Message)"
-                    }
-                    elseif ($pending.Process.ExitCode -ne 0) {
-                        Write-Verbose "WinGet completion failed (exit code $($pending.Process.ExitCode)): $($pending.Error.Result.Trim())"
-                    }
-                    else {
-                        $failed = $false
-                        $results = foreach ($candidate in $pending.Output.Result -split '\r?\n') {
-                            if (-not [string]::IsNullOrWhiteSpace($candidate)) {
-                                [System.Management.Automation.CompletionResult]::new($candidate, $candidate, 'ParameterValue', $candidate)
-                            }
-                        }
-                        [void]$cache.Remove($pending.Key)
-                        if ($cache.Count -ge 64) {
-                            $cache.RemoveAt(0)
-                        }
-                        $ttl = if ($results) { 60000 } else { 15000 }
-                        $cache.Add($pending.Key, @{
-                            Results = $results
-                            RefreshAt = $pending.StartedAt + $ttl
-                            ExpiresAt = $pending.StartedAt + 300000
-                        })
-                    }
-                }
-                finally {
-                    $pending.Process.Dispose()
-                }
+                $received = & $receiveWingetCompletion $pending
+                $failed = -not $received -and $key.Equals($pending.Key)
                 $pending = $null
             }
 
@@ -287,10 +296,31 @@ Set-Variable -Name DotfilesProfileLoaded -Value $true -Scope Global
 
             if ($entry) {
                 $entry.Results
+                return
             }
-            elseif ($wingetState.Pending -and $key.Equals($wingetState.Pending.Key)) {
-                # An empty string suppresses filename completion while WinGet is still working.
-                ''
+
+            $pending = $wingetState.Pending
+            if ($pending -and $key.Equals($pending.Key)) {
+                # PSReadLine needs the matches before this completion call returns.
+                $remaining = [Math]::Max(0, $pending.Deadline - [Environment]::TickCount64)
+                if (-not $pending.TimedOut) {
+                    try {
+                        $null = $pending.Done.Wait([int]$remaining)
+                    }
+                    catch [AggregateException] {
+                        if (-not $pending.Done.IsFaulted) {
+                            throw
+                        }
+                        # The receiver reports the task error.
+                    }
+                }
+                if (-not $pending.Done.IsCompleted -and -not $pending.TimedOut) {
+                    $pending.TimedOut = $true
+                    & $wingetState.Stop $pending.Process
+                }
+                if (& $receiveWingetCompletion $pending) {
+                    $cache[$key].Results
+                }
             }
         }.GetNewClosure())
     }
